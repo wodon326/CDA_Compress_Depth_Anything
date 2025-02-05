@@ -131,7 +131,7 @@ class State(object):
 
     def capture(self):
         return {
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': self.model.module.state_dict() if isinstance(self.model, DDP) else self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
         }
@@ -153,6 +153,7 @@ def train(rank, world_size, args):
         setup(rank, world_size)
         torch.cuda.set_device(rank)
         torch.cuda.empty_cache()
+        save_step = args.save_step
 
         if(args.model_type == 'depth_latent1_avg_ver'):
             CDA = depth_latent1_avg_ver().to(rank)
@@ -179,26 +180,19 @@ def train(rank, world_size, args):
         print("Parameter Count: %d" % count_parameters(model))
         train_loader = datasets.fetch_dataloader(args, rank, world_size)
         optimizer, scheduler = fetch_optimizer(args, model)
-        total_steps = 0
         if rank == 0:
             logger = Logger(model, scheduler,args.model_type)
         state = State(model, optimizer, scheduler)
 
         model.train()
-        #model.module.freeze_bn() # We keep BatchNorm frozen
-
-        validation_frequency = 10000
-
         scaler = GradScaler(enabled=args.mixed_precision)
-
         should_keep_training = True
-        global_batch_num = 0
+        total_steps = 0
         epoch = 0
 
         SSILoss = ScaleAndShiftInvariantLoss()
         grad_loss = GradientMatchingLoss()
 
-        save_step = 200
 
         # load snapshot
         if args.restore_ckpt is not None:
@@ -231,13 +225,13 @@ def train(rank, world_size, args):
 
 
                 if(rank==0):
-                    logger.writer.add_scalar("live_loss", l_si.item(), global_batch_num)
+                    logger.writer.add_scalar("live_loss", l_si.item(), total_steps)
                     
-                    logger.writer.add_scalar("gradient_matching_loss", l_grad.item(), global_batch_num)
+                    logger.writer.add_scalar("gradient_matching_loss", l_grad.item(), total_steps)
                     
-                    logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
+                    logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], total_steps)
 
-                    if(total_steps % 10 == 10-1):
+                    if(total_steps % args.visualize_step == args.visualize_step-1):
                         # inference visualization in tensorboard while training
                         rgb = depth_image[0].cpu().detach().numpy()
                         rgb = ((rgb - np.min(rgb)) / (np.max(rgb) - np.min(rgb))) * 255
@@ -248,16 +242,16 @@ def train(rank, world_size, args):
                         pred = flow_predictions[0].cpu().detach().numpy()
                         pred = ((pred - np.min(pred)) / (np.max(pred) - np.min(pred))) * 255
             
-                        logger.writer.add_image('RGB', rgb.astype(np.uint8), global_batch_num)
-                        logger.writer.add_image('GT', gt.astype(np.uint8), global_batch_num)
-                        logger.writer.add_image('Prediction', pred.astype(np.uint8), global_batch_num)
+                        logger.writer.add_image('RGB', rgb.astype(np.uint8), total_steps)
+                        logger.writer.add_image('GT', gt.astype(np.uint8), total_steps)
+                        logger.writer.add_image('Prediction', pred.astype(np.uint8), total_steps)
                     _ , metrics = sequence_loss(flow_predictions, flow, valid)
                     logger.push(metrics)
 
                 
 
 
-                global_batch_num += 1
+                total_steps += 1
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -307,6 +301,8 @@ if __name__ == '__main__':
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
     parser.add_argument('--epoch', type=int, default=3, help="length of training schedule.")
     parser.add_argument('--model_type', type=str, help="model_type")
+    parser.add_argument('--save_step', type=int, default=200, help="save_step")
+    parser.add_argument('--visualize_step', type=int, default=10, help="visualize_step")
 
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=6, help="batch size used during training.")
