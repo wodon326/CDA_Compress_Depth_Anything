@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from CDA.depth_latent1_avg_ver import depth_latent1_avg_ver
+from CDA.depth_latent4_avg_ver import depth_latent4_avg_ver
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -75,12 +76,13 @@ class Logger:
 
     SUM_FREQ = 100
 
-    def __init__(self, model, scheduler):
+    def __init__(self, model, scheduler, model_type):
         self.model = model
         self.scheduler = scheduler
         self.total_steps = 0
         self.running_loss = {}
-        self.writer = SummaryWriter(log_dir='runs')
+        self.model_type = model_type
+        self.writer = SummaryWriter(log_dir=f'runs/{self.model_type}')
 
     def _print_training_status(self):
         metrics_data = [self.running_loss[k]/Logger.SUM_FREQ for k in sorted(self.running_loss.keys())]
@@ -91,7 +93,7 @@ class Logger:
         logging.info(f"Training Metrics ({self.total_steps}): {training_str + metrics_str}")
 
         if self.writer is None:
-            self.writer = SummaryWriter(log_dir='runs')
+            self.writer = SummaryWriter(log_dir=f'runs/{self.model_type}')
 
         for k in self.running_loss:
             self.writer.add_scalar(k, self.running_loss[k]/Logger.SUM_FREQ, self.total_steps)
@@ -112,7 +114,7 @@ class Logger:
 
     def write_dict(self, results):
         if self.writer is None:
-            self.writer = SummaryWriter(log_dir='runs')
+            self.writer = SummaryWriter(log_dir=f'runs/{self.model_type}')
 
         for key in results:
             self.writer.add_scalar(key, results[key], self.total_steps)
@@ -134,17 +136,17 @@ class State(object):
             'scheduler_state_dict': self.scheduler.state_dict(),
         }
     
-    def apply_snapshot(self, obj, device):
-        self.model.load_state_dict(obj['model_state_dict'].to(device), strict=False)
-        self.optimizer.load_state_dict(obj['optimizer_state_dict'].to(device))
-        self.scheduler.load_state_dict(obj['scheduler_state_dict'].to(device))
+    def apply_snapshot(self, obj):
+        self.model.load_state_dict(obj['model_state_dict'], strict=False)
+        self.optimizer.load_state_dict(obj['optimizer_state_dict'])
+        self.scheduler.load_state_dict(obj['scheduler_state_dict'])
     
     def save(self, path):
         torch.save(self.capture(), path)
     
     def load(self, path, device):
-        obj = torch.load(path, map_location=torch.device('cpu'))
-        self.apply_snapshot(obj, device)
+        obj = torch.load(path, map_location=device)
+        self.apply_snapshot(obj)
 
 def train(rank, world_size, args):
     try:
@@ -152,15 +154,22 @@ def train(rank, world_size, args):
         torch.cuda.set_device(rank)
         torch.cuda.empty_cache()
 
-        
-        CDA = depth_latent1_avg_ver().to(rank)
-        student_ckpt = '/home/wodon326/datasets/AsymKD_checkpoints/depth_anything_v2_vits.pth'
+        if(args.model_type == 'depth_latent1_avg_ver'):
+            CDA = depth_latent1_avg_ver().to(rank)
+            student_ckpt = '/home/wodon326/datasets/AsymKD_checkpoints/depth_anything_v2_vits.pth'
 
-        teacher_ckpt = '/home/wodon326/datasets/AsymKD_checkpoints/depth_anything_v2_vitl.pth'
-        CDA.load_backbone_from_ckpt(student_ckpt, teacher_ckpt, device=torch.device('cuda', rank))
-        
+            teacher_ckpt = '/home/wodon326/datasets/AsymKD_checkpoints/depth_anything_v2_vitl.pth'
+            CDA.load_backbone_from_ckpt(student_ckpt, teacher_ckpt, device=torch.device('cuda', rank))
+            CDA.freeze_depth_latent1_style()
+        elif(args.model_type == 'depth_latent4_avg_ver'):
+            CDA = depth_latent4_avg_ver().to(rank)
+            student_ckpt = '/home/wodon326/datasets/AsymKD_checkpoints/depth_anything_v2_vits.pth'
 
-        CDA.freeze_depth_latent1_style()
+            teacher_ckpt = '/home/wodon326/datasets/AsymKD_checkpoints/depth_anything_v2_vitl.pth'
+            CDA.load_backbone_from_ckpt(student_ckpt, teacher_ckpt, device=torch.device('cuda', rank))
+            CDA.freeze_depth_latent4_style()
+
+
         if rank == 0:
             for n, p in CDA.named_parameters():
                 print(f'{n} : {p.requires_grad}')
@@ -172,8 +181,8 @@ def train(rank, world_size, args):
         optimizer, scheduler = fetch_optimizer(args, model)
         total_steps = 0
         if rank == 0:
-            logger = Logger(model, scheduler)
-            state = State(model, optimizer, scheduler)
+            logger = Logger(model, scheduler,args.model_type)
+        state = State(model, optimizer, scheduler)
 
         model.train()
         #model.module.freeze_bn() # We keep BatchNorm frozen
@@ -190,6 +199,11 @@ def train(rank, world_size, args):
         grad_loss = GradientMatchingLoss()
 
         save_step = 200
+
+        # load snapshot
+        if args.restore_ckpt is not None:
+            assert args.restore_ckpt.endswith(".pth")
+            state.load(args.restore_ckpt, torch.device('cuda', rank))
         
         while should_keep_training:
 
@@ -254,7 +268,7 @@ def train(rank, world_size, args):
 
 
                 if epoch >= 0 and total_steps % save_step == save_step-1 and rank == 0:
-                    save_path = Path('checkpoint_stage1_depth_latent1/%d_%s.pth' % (total_steps + 1, args.name))
+                    save_path = Path('checkpoint_stage1_%s/%d_%s.pth' % (args.model_type,total_steps + 1, args.name))
                     logging.info(f"Saving file {save_path.absolute()}")
                     state.save(save_path)
 
@@ -272,14 +286,14 @@ def train(rank, world_size, args):
                     break
             epoch += 1     
             if len(train_loader) >= 10000:
-                save_path = Path('checkpoint_stage1_depth_latent1/%d_epoch_%s.pth' % (total_steps + 1, args.name))
+                save_path = Path('checkpoint_stage1_%s/%d_%s.pth' % (args.model_type,total_steps + 1, args.name))
                 logging.info(f"Saving file {save_path}")
                 state.save(save_path)
                 
 
         print("FINISHED TRAINING")
         logger.close()
-        PATH = 'checkpoint_stage1_depth_latent1/%s.pth' % args.name
+        PATH = 'checkpoint_stage1_%s/%s.pth' % (args.model_type,args.name)
         state.save(PATH)
 
         return PATH
@@ -292,6 +306,7 @@ if __name__ == '__main__':
     parser.add_argument('--restore_ckpt', help="restore checkpoint")
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
     parser.add_argument('--epoch', type=int, default=3, help="length of training schedule.")
+    parser.add_argument('--model_type', type=str, help="model_type")
 
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=6, help="batch size used during training.")
@@ -330,6 +345,6 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s')
     # print('args.epoch : ', args.epoch)
-    Path("checkpoint_stage1_depth_latent1").mkdir(exist_ok=True, parents=True)
+    Path(f"checkpoint_stage1_{args.model_type}").mkdir(exist_ok=True, parents=True)
     world_size = torch.cuda.device_count()
     mp.spawn(train, args=(world_size,args,), nprocs=world_size, join=True)

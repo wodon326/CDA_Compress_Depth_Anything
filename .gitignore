@@ -16,7 +16,7 @@ eval_result*
 evaluation/output/
 # Created by https://www.toptal.com/developers/gitignore/api/python,visualstudiocode
 # Edit at https://www.toptal.com/developers/gitignore?templates=python,visualstudiocode
-
+Exception_catch.txt
 ### Python ###
 # Byte-compiled / optimized / DLL files
 __pycache__/
